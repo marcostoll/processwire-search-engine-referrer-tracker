@@ -175,7 +175,7 @@ class SearchEngineReferrerTracker extends WireData implements Module, Configurab
         if ($page->template == 'admin') return;
 
         // simulate
-        $_SERVER['HTTP_REFERER'] = 'https://www.google.de/search?q=neuwaerts&ie=utf8';
+        //$_SERVER['HTTP_REFERER'] = 'https://www.google.de/search?q=neuwaerts&ie=utf8';
 
         if (!isset($_SERVER['HTTP_REFERER']) || empty($_SERVER['HTTP_REFERER'])) return;
 
@@ -193,8 +193,6 @@ class SearchEngineReferrerTracker extends WireData implements Module, Configurab
         if (empty($keyword)) return;
 
         $this->trackReferrer($this->page->id, $keyword);
-
-        var_dump($this->getTopKeywords($page->id));
     }
 
     /**
@@ -244,7 +242,6 @@ class SearchEngineReferrerTracker extends WireData implements Module, Configurab
         // check cached data
         $cacheTime = $this->get('cache_time');
         $cacheKey = 'sert_' . (!is_null($pageId) ? $pageId : 'site') . '_' . $amount;
-
         if ($cacheTime > 0) {
             $data = wire('modules')->get('MarkupCache')->get($cacheKey);
             if ($data) {
