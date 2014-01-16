@@ -55,3 +55,13 @@ The single page mode can be used via a page hook as well.
 
 	// retrieve list of top keywords for single page via page hook
 	$topKeywordsPage = $page->getTopKeywords();
+
+The return value would be an array of associative arrays with the keys `keyword`and `ref_count`. Of course the the return value may be an empty array as well if no keywords have been tracked for the site or page.
+Here is a typical return value structure encoded in JSON:
+
+	[
+		{"keyword":"processwire", "ref_count":42},
+		{"keyword":"module", "ref_count":28},
+		{"keyword":"neuwaerts", "ref_count":19},
+		...
+	]
