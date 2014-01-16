@@ -1,0 +1,354 @@
+<?php
+
+/**
+ * Class definition of ProcessWire module SearchEngineReferrerTracker
+ *
+ * See README.md for usage instructions.
+ *
+ * @author Marco Stoll <marco.stoll@neuwaerts.de>
+ * @version 1.0.1
+ * @copyright Copyright (c) 2014, neuwaerts GmbH
+ * @filesource
+ * @see https://github.com/marcostoll/processwire-search-engine-referrer-tracker
+ * @see http://www.neuwaerts.de
+ * @see http://www.processwire.com
+ */
+
+/**
+ * Class SearchEngineReferrerTracker
+ */
+class SearchEngineReferrerTracker extends WireData implements Module, ConfigurableModule {
+
+    /**
+     * List of search engines
+     *
+     * @var array
+     */
+    protected static $searchEngines = array(
+        'google' => array('arg' => 'q', 'host_pattern' => '/^(www\.)?google\./'),
+        'bing'   => array('arg' => 'q', 'host_pattern' => '/^(www\.)?bing\.com$/'),
+        'yahoo'  => array('arg' => 'p', 'host_pattern' => '/^([a-z])\.search\.yahoo\.com$/'),
+        'ask'    => array('arg' => 'q', 'host_pattern' => '/^(www\.)?ask\.com$/'),
+    );
+
+    /**
+     * @field array Default config values
+     */
+    protected static $defaults = array(
+        'keyword_amount' => 10,
+        'cache_time'     => 300,
+        'stop_words'     => ''
+    );
+
+    /**
+     * Retrieves module meta data
+     *
+     * Implementation of the Module interface
+     *
+     * @return array
+     * @see http://processwire.com/apigen/class-Module.html
+     */
+	public static function getModuleInfo() {
+
+		return array(
+
+			// The module's title, typically a little more descriptive than the class name
+			'title' => 'Search Engine Referrer Tracker',
+
+			// version: major, minor, revision, i.e. 100 = 1.0.0
+			'version' => 101,
+
+			// summary is brief description of what this module is
+			'summary' => 'Collects search key words from several referrers '
+                . '(currently supported are Google, Yahoo, Bing, and Ask)',
+			
+			// Optional URL to more information about the module
+			'href' => 'https://github.com/marcostoll/processwire-search-engine-referrer-tracker',
+
+			// singular=true: indicates that only one instance of the module is allowed.
+			// This is usually what you want for modules that attach hooks. 
+			'singular' => true, 
+
+			// autoload=true: indicates the module should be started with ProcessWire.
+			// This is necessary for any modules that attach runtime hooks, otherwise those
+			// hooks won't get attached unless some other code calls the module on it's own.
+			// Note that autoload modules are almost always also 'singular' (seen above).
+			'autoload' => true, 
+		);
+	}
+
+    /**
+     * Retrieves the list of config input fields
+     *
+     * Implementation of the ConfigurableModule interface
+     *
+     * @param array $data The config data
+     * @return InputfieldWrapper
+     * @see http://processwire.com/apigen/class-ConfigurableModule.html
+     */
+    public static function getModuleConfigInputfields(array $data) {
+
+        $data = array_merge(self::$defaults, $data);
+
+        $fields = new InputfieldWrapper();
+        $modules = wire('modules');
+
+        $field = $modules->get('InputfieldText');
+        $field->label = __('Amount of referrer keywords to load per default');
+        $field->attr('name', 'keyword_amount');
+        $field->attr('size', 30);
+        $field->attr('value', $data['keyword_amount']);
+
+        $fields->append($field);
+
+        $field = $modules->get('InputfieldText');
+        $field->label = __('Amount of seconds to cache keyword lists (use 0 to disable caching)');
+        $field->attr('name', 'cache_time');
+        $field->attr('size', 30);
+        $field->attr('value', $data['cache_time']);
+
+        $fields->append($field);
+
+        $field = $modules->get('InputfieldTextarea');
+        $field->label = __('A comma-separated list of stop words');
+        $field->attr('name', 'stop_words');
+        $field->attr('rows', 10);
+        $field->attr('value', $data['stop_words']);
+
+        $fields->append($field);
+
+        $field = $modules->get('InputfieldCheckbox');
+        $field->label = __('Reset keyword trackings');
+        $field->description = __('If checked all previously tracked referrer keywords will be deleted');
+        $field->attr('name', 'reset');
+
+        $fields->append($field);
+
+        $reset = wire('input')->post->reset ? true : false;
+        if ($reset) self::resetKeywords();
+
+        return $fields;
+    }
+
+    /**
+     * Initialize the module
+     *
+     * Implementation of the Module interface
+     *
+     * ProcessWire calls this when the module is loaded. For 'autoload' modules, this will be called
+     * when ProcessWire's API is ready. As a result, this is a good place to attach hooks.
+     *
+     * @see http://processwire.com/apigen/class-Module.html
+     */
+	public function init() {
+
+        $this->addHookBefore('ProcessPageView::ready', $this, 'inspectReferrerHook');
+        $this->addHookBefore('Pages::trashed', $this, 'removeKeywordsHook');
+        $this->addHookBefore('Pages::deleted', $this, 'removeKeywordsHook');
+        $this->addHook('Page::getTopKeywords', $this, 'getTopKeywordsHook');
+	}
+
+    /**
+     * Creates the database table for storing referrer data
+     */
+    public function ___install() {
+
+        $sql = 'CREATE TABLE IF NOT EXISTS `module_sert_keywords` ('
+            . '`page_id` INT NOT NULL , '
+            . '`keyword` VARCHAR( 255 ) NOT NULL , '
+            . '`ref_count` INT NOT NULL , '
+            . 'PRIMARY KEY ( `page_id` , `keyword` ) );';
+
+        $this->db->query($sql);
+    }
+
+    /**
+     * Hook callback for ProcessPageView::ready
+     *
+     * @param HookEvent $event The hook event
+     */
+    public function inspectReferrerHook(HookEvent $event) {
+
+        $page = wire('page');
+
+        // don't mess with admin templates
+        if ($page->template == 'admin') return;
+
+        // simulate
+        $_SERVER['HTTP_REFERER'] = 'https://www.google.de/search?q=neuwaerts&ie=utf8';
+
+        if (!isset($_SERVER['HTTP_REFERER']) || empty($_SERVER['HTTP_REFERER'])) return;
+
+        $urlParts = parse_url($_SERVER['HTTP_REFERER']);
+        if (!isset($urlParts['query']) || empty($urlParts['query'])) return;
+
+        parse_str($urlParts['query'], $queryArgs);
+        $keyword = null;
+        foreach (self::$searchEngines as $name => $config) {
+            if (!preg_match($config['host_pattern'], $urlParts['host'])) continue;
+            if (!isset($queryArgs[$config['arg']]) || empty($queryArgs[$config['arg']])) continue;
+
+            $keyword = $this->normalizeKeyword($queryArgs[$config['arg']]);
+        }
+        if (empty($keyword)) return;
+
+        $this->trackReferrer($this->page->id, $keyword);
+
+        var_dump($this->getTopKeywords($page->id));
+    }
+
+    /**
+     * Hook callback for Page::getTopKeywords
+     *
+     * @param HookEvent $event The hook event
+     * @return array
+     */
+    public function getTopKeywordsHook(HookEvent $event) {
+
+        $page = $event->object;
+        $amount = $event->arguments(0);
+
+        $event->return = $this->getTopKeywords($page->id, $amount);
+    }
+
+    /**
+     * Removes all referrer keywords associated with the given page
+     * @param HookEvent $event The hook event
+     */
+    public function removeKeywordsHook(HookEvent $event) {
+
+        $page = $event->arguments(0);
+
+        $sql = 'DELETE FROM module_sert_keywords '
+            . 'WHERE page_id=' . (int)$page->id;
+        $this->db->query($sql);
+    }
+
+    /**
+     * Retrieves the top referred keywords
+     *
+     * If $pageId is omitted, the whole site is scanned.
+     * Otherwise only referrer keywords associated to the given page are scanned.
+     *
+     * If $amount is omitted, the default amount from the module configuration
+     * will be used.
+     *
+     * @param int|null $amount The amount of keywords to return
+     * @param int|null $pageId The page id or null
+     * @return array
+     */
+    public function getTopKeywords($pageId = null, $amount = null) {
+
+        if (is_null($amount)) $amount = $this->get('keyword_amount');
+
+        // check cached data
+        $cacheTime = $this->get('cache_time');
+        $cacheKey = 'sert_' . (!is_null($pageId) ? $pageId : 'site') . '_' . $amount;
+
+        if ($cacheTime > 0) {
+            $data = wire('modules')->get('MarkupCache')->get($cacheKey);
+            if ($data) {
+                return unserialize($data);
+            }
+        }
+
+        if (!is_null($pageId)) {
+            $sql = 'SELECT keyword, ref_count FROM module_sert_keywords '
+                . 'WHERE page_id=' . (int)$pageId . ' '
+                . 'ORDER BY ref_count DESC '
+                . 'LIMIT ' . (int)$amount;
+        } else {
+            $sql = 'SELECT keyword, SUM(ref_count) AS ref_count '
+                . 'FROM `module_sert_keywords` '
+                . 'GROUP BY keyword '
+                . 'ORDER BY ref_count DESC '
+                . 'LIMIT ' . (int)$amount;
+        }
+
+        $result = $this->db->query($sql);
+        $data = $result->fetch_all(MYSQLI_ASSOC);
+
+        // cache computed data
+        if ($cacheTime > 0) {
+            wire('modules')->get('MarkupCache')->save(serialize($data), $cacheTime);
+        }
+
+        return $data;
+    }
+
+    /**
+     * Normalizes a keyword
+     *
+     * @param string $keyword
+     * @return string
+     */
+    protected function normalizeKeyword($keyword) {
+
+        return preg_replace('/\s+/', ' ', strtolower(trim($keyword)));
+    }
+
+    /**
+     * Tracks a referrer keyword in the database
+     *
+     * @param int $pageId
+     * @param string $keyword
+     */
+    protected function trackReferrer($pageId, $keyword) {
+
+        // check against stop word list
+        $keyWordList = explode(' ', $keyword);
+        foreach ($keyWordList as $term) {
+            if ($this->isStopWord($term)) return;
+        }
+
+        $keyword = $this->db->escapeStr($keyword);
+
+        $sql = 'SELECT * FROM module_sert_keywords '
+            . 'WHERE page_id=' . (int)$pageId . ' '
+            . 'AND keyword=\'' . $keyword . '\'';
+        $result = $this->db->query($sql);
+
+        if ($result->num_rows > 0) {
+            $row = $result->fetch_assoc();
+            $sql = 'UPDATE module_sert_keywords '
+                . 'SET ref_count=' . ++$row['ref_count'] . ' '
+                . 'WHERE page_id=' . (int)$pageId . ' '
+                . 'AND keyword=\'' . $keyword . '\'';
+            $this->db->query($sql);
+        } else {
+            $sql = 'INSERT INTO module_sert_keywords '
+                . 'VALUES (' . (int)$pageId . ', \'' . $keyword . '\', 1)';
+            $this->db->query($sql);
+        }
+    }
+
+    /**
+     * Checks whether the given keyword appears in the stop word list
+     *
+     * @param string $keyword
+     * @return boolean True if keyword appears in stop word list, false otherwise
+     */
+    protected function isStopWord($keyword) {
+
+        static $stopWords = null;
+
+        if (is_null($stopWords)) {
+            $stopWords = preg_split('/\s*,\s*/', strtolower(trim($this->get('stop_words'))), - 1, PREG_SPLIT_NO_EMPTY);
+        }
+
+        if (array_search($keyword, $stopWords) === false) {
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Truncates the database table
+     */
+    protected static function resetKeywords() {
+
+        $sql = 'TRUNCATE module_sert_keywords';
+        wire('db')->query($sql);
+    }
+
+}
